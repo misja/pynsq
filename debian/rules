@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME=pynsq
+export PYBUILD_DISABLE_python2=test
+export PYBUILD_DISABLE_python3=test
+
+%:
+	dh $@ --with python2,python3 --buildsystem=pybuild
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf .cache
+	rm -rf .eggs
+	rm -rf .pybuild
+	rm -rf pynsq.egg-info
+
