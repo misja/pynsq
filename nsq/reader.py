@@ -317,21 +317,7 @@ class Reader(Client):
             logger.exception('[%s:%s] failed to handle_message() %r', conn.id, self.name, message)
 
     def _handle_message(self, conn, message):
-        self.total_rdy = max(self.total_rdy - 1, 0)
-
-        rdy_conn = conn
-        if len(self.conns) > self.max_in_flight and time.time() - self.random_rdy_ts > 30:
-            # if all connections aren't getting RDY
-            # occsionally randomize which connection gets RDY
-            self.random_rdy_ts = time.time()
-            conns_with_no_rdy = [c for c in itervalues(self.conns) if not c.rdy]
-            if conns_with_no_rdy:
-                rdy_conn = random.choice(conns_with_no_rdy)
-                if rdy_conn is not conn:
-                    logger.info('[%s:%s] redistributing RDY to %s',
-                                conn.id, self.name, rdy_conn.id)
-
-        self._maybe_update_rdy(rdy_conn)
+        self._maybe_update_rdy(conn)
 
         success = False
         try:
@@ -358,7 +344,9 @@ class Reader(Client):
         if self.backoff_timer.get_interval() or self.max_in_flight == 0:
             return
 
-        if conn.rdy <= 1 or conn.rdy < int(conn.last_rdy * 0.25):
+        # On a new connection or in backoff we start with a tentative RDY count
+        # of 1.  After successfully receiving a first message we go to full throttle.
+        if conn.rdy == 1:
             self._send_rdy(conn, self._connection_max_in_flight())
 
     def _finish_backoff_block(self):
@@ -452,16 +440,12 @@ class Reader(Client):
         if value > conn.max_rdy_count:
             value = conn.max_rdy_count
 
-        if (self.total_rdy + value) > self.max_in_flight:
-            if not conn.rdy:
-                # if we're going from RDY 0 to non-0 and we couldn't because
-                # of the configured max in flight, try again
-                rdy_retry_callback = functools.partial(self._rdy_retry, conn, value)
-                conn.rdy_timeout = self.io_loop.add_timeout(time.time() + 5, rdy_retry_callback)
+        new_rdy = max(self.total_rdy - conn.rdy + value, 0)
+        if new_rdy > self.max_in_flight:
             return
 
         if conn.send_rdy(value):
-            self.total_rdy = max(self.total_rdy - conn.rdy + value, 0)
+            self.total_rdy = new_rdy
 
     def connect_to_nsqd(self, host, port):
         """
@@ -582,6 +566,7 @@ class Reader(Client):
 
         req = tornado.httpclient.HTTPRequest(
             lookupd_url, method='GET',
+            headers={'Accept': 'application/vnd.nsq; version=1.0'},
             connect_timeout=self.lookupd_connect_timeout,
             request_timeout=self.lookupd_request_timeout)
         callback = functools.partial(self._finish_query_lookupd, lookupd_url=lookupd_url)
@@ -600,22 +585,17 @@ class Reader(Client):
                            self.name, lookupd_url, response.body)
             return
 
-        if lookup_data['status_code'] != 200:
-            logger.warning('[%s] lookupd %s responded with %d',
-                           self.name, lookupd_url, lookup_data['status_code'])
-            return
-
-        for producer in lookup_data['data']['producers']:
+        for producer in lookup_data['producers']:
             # TODO: this can be dropped for 1.0
             address = producer.get('broadcast_address', producer.get('address'))
             assert address
             self.connect_to_nsqd(address, producer['tcp_port'])
-    
+
     def set_max_in_flight(self, max_in_flight):
         """dynamically adjust the reader max_in_flight count. Set to 0 to immediately disable a Reader"""
         assert isinstance(max_in_flight, int)
         self.max_in_flight = max_in_flight
-        
+
         if max_in_flight == 0:
             # set RDY 0 to all connections
             for conn in itervalues(self.conns):
@@ -626,8 +606,7 @@ class Reader(Client):
         else:
             self.need_rdy_redistributed = True
             self._redistribute_rdy_state()
-    
-    
+
     def _redistribute_rdy_state(self):
         # We redistribute RDY counts in a few cases:
         #
@@ -669,21 +648,36 @@ class Reader(Client):
                     logger.info('[%s:%s] idle connection, giving up RDY count', conn.id, self.name)
                     self._send_rdy(conn, 0)
 
+            conns = self.conns.values()
+
+            in_flight_or_rdy = len([c for c in conns if c.in_flight or c.rdy])
             if backoff_interval:
-                max_in_flight = 1 - self.total_rdy
+                available_rdy = max(0, 1 - in_flight_or_rdy)
             else:
-                max_in_flight = self.max_in_flight - self.total_rdy
+                available_rdy = max(0, self.max_in_flight - in_flight_or_rdy)
+
+            # if moving any connections from RDY 0 to non-0 would violate in-flight constraints,
+            # set RDY 0 on some connection with msgs in flight so that a later redistribution
+            # round can proceed and we don't stay pinned to the same connections.
+            #
+            # if nothing's in flight, then we have connections with RDY 1 that are still
+            # waiting to hit the idle timeout, in which case it's ok to do nothing.
+            in_flight = [c for c in conns if c.in_flight]
+            if in_flight and not available_rdy:
+                c = random.choice(in_flight)
+                logger.info('[%s:%s] too many msgs in flight, giving up RDY count', c.id, self.name)
+                self._send_rdy(c, 0)
 
             # randomly walk the list of possible connections and send RDY 1 (up to our
-            # calculate "max_in_flight").  We only need to send RDY 1 because in both
+            # calculated "max_in_flight").  We only need to send RDY 1 because in both
             # cases described above your per connection RDY count would never be higher.
             #
             # We also don't attempt to avoid the connections who previously might have had RDY 1
             # because it would be overly complicated and not actually worth it (ie. given enough
             # redistribution rounds it doesn't matter).
-            possible_conns = list(self.conns.values())
-            while possible_conns and max_in_flight:
-                max_in_flight -= 1
+            possible_conns = [c for c in conns if not (c.in_flight or c.rdy)]
+            while possible_conns and available_rdy:
+                available_rdy -= 1
                 conn = possible_conns.pop(random.randrange(len(possible_conns)))
                 logger.info('[%s:%s] redistributing RDY', conn.id, self.name)
                 self._send_rdy(conn, 1)
@@ -716,8 +710,7 @@ class Reader(Client):
         """
         logger.warning('[%s] giving up on message %s after %d tries (max:%d) %r',
                        self.name, message.id, message.attempts, self.max_tries, message.body)
-                       
-        
+
     def _on_connection_identify_response(self, conn, data, **kwargs):
         if not hasattr(self, '_disabled_notice'):
             self._disabled_notice = True
@@ -728,16 +721,16 @@ class Reader(Client):
                         return int(x)
                     except:
                         return x
-                return [cast(x) for x in v.replace('-','.').split('.')]
+                return [cast(x) for x in v.replace('-', '.').split('.')]
 
-            if self.disabled.__code__ != Reader.disabled.__code__ and semver(data['version']) >= semver('0.3'):
-                logging.warning('disabled() deprecated and incompatible with nsqd >= 0.3. ' + 
-                    'It will be removed in a future release. Use set_max_in_flight(0) instead')
+            if self.disabled.__code__ != Reader.disabled.__code__ and \
+               semver(data['version']) >= semver('0.3'):
+                logging.warning('disabled() deprecated and incompatible with nsqd >= 0.3. ' +
+                                'It will be removed in a future release. Use set_max_in_flight(0) instead')
                 warnings.warn('disabled() is deprecated and will be removed in a future release, ' +
-                    'use set_max_in_flight(0) instead', DeprecationWarning)
+                              'use set_max_in_flight(0) instead', DeprecationWarning)
         return super(Reader, self)._on_connection_identify_response(conn, data, **kwargs)
 
-        
     @classmethod
     def disabled(cls):
         """
@@ -745,7 +738,7 @@ class Reader(Client):
 
         This is useful to subclass and override to examine a file on disk or a key in cache
         to identify if this reader should pause execution (during a deploy, etc.).
-        
+
         Note: deprecated. Use set_max_in_flight(0)
         """
         return False

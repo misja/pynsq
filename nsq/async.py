@@ -215,8 +215,17 @@ class AsyncConn(event.EventedMixin):
     def __str__(self):
         return self.host + ':' + str(self.port)
 
+    def connected(self):
+        return self.state == CONNECTED
+
+    def connecting(self):
+        return self.state == CONNECTING
+
+    def closed(self):
+        return self.state in (INIT, DISCONNECTED)
+
     def connect(self):
-        if self.state not in [INIT, DISCONNECTED]:
+        if not self.closed():
             return
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -225,6 +234,7 @@ class AsyncConn(event.EventedMixin):
 
         self.stream = tornado.iostream.IOStream(self.socket, io_loop=self.io_loop)
         self.stream.set_close_callback(self._socket_close)
+        self.stream.set_nodelay(True)
 
         self.state = CONNECTING
         self.on(event.CONNECT, self._on_connect)
@@ -352,8 +362,10 @@ class AsyncConn(event.EventedMixin):
 
     def _on_connect(self, **kwargs):
         identify_data = {
-            'short_id': self.short_hostname,
-            'long_id': self.hostname,
+            'short_id': self.short_hostname, # TODO remove when deprecating pre 1.0 support
+            'long_id': self.hostname, # TODO remove when deprecating pre 1.0 support
+            'client_id': self.short_hostname,
+            'hostname': self.hostname,
             'heartbeat_interval': self.heartbeat_interval,
             'feature_negotiation': True,
             'tls_v1': self.tls_v1,
@@ -474,7 +486,6 @@ class AsyncConn(event.EventedMixin):
         frame, data = protocol.unpack_response(data)
         if frame == protocol.FRAME_TYPE_MESSAGE:
             self.last_msg_timestamp = time.time()
-            self.rdy = max(self.rdy - 1, 0)
             self.in_flight += 1
 
             message = protocol.decode_message(data)

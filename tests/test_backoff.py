@@ -52,6 +52,7 @@ def _get_conn(reader):
 
 def _send_message(conn):
     msg = _get_message(conn)
+    conn.in_flight += 1
     conn.trigger(event.MESSAGE, conn=conn, message=msg)
     return msg
 
@@ -284,8 +285,8 @@ def test_backoff_hard():
     assert r.backoff_block is False
     assert r.backoff_timer.get_interval() == 0
 
-    for i, call in enumerate(conn.stream.write.call_args_list):
-        print("%d: %s" % (i, call))
+    for i, f in enumerate(conn.stream.write.call_args_list):
+        print("%d: %s" % (i, f))
     assert conn.stream.write.call_args_list == [call(arg) for arg in expected_args]
 
 
@@ -383,8 +384,8 @@ def test_backoff_many_conns():
     assert r.backoff_timer.get_interval() == 0
 
     for c in conns:
-        for i, call in enumerate(c.stream.write.call_args_list):
-            print("%d: %s" % (i, call))
+        for i, f in enumerate(c.stream.write.call_args_list):
+            print("%d: %s" % (i, f))
         assert c.stream.write.call_args_list == [call(arg) for arg in c.expected_args]
 
 
@@ -490,6 +491,6 @@ def test_backoff_conns_disconnect():
     assert r.backoff_timer.get_interval() == 0
 
     for c in conns:
-        for i, call in enumerate(c.stream.write.call_args_list):
-            print("%d: %s" % (i, call))
+        for i, f in enumerate(c.stream.write.call_args_list):
+            print("%d: %s" % (i, f))
         assert c.stream.write.call_args_list == [call(arg) for arg in c.expected_args]
