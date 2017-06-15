@@ -1,3 +1,9 @@
+pynsq (0.8.1-1) unstable; urgency=low
+
+  * new upstream release
+
+ -- Misja Hoebe <misja.hoebe@gmail.com>  Thu, 15 Jun 2017 19:54:11 +0100
+
 pynsq (0.7.1-1) unstable; urgency=low
 
   * new upstream release
